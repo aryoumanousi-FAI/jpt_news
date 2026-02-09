@@ -45,6 +45,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Sanity check master with pandas (real rows/URLs)
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          p = "jpt_scraper/data/jpt.csv"
+          df = pd.read_csv(p, dtype=str, keep_default_na=False, engine="python")
+          print("rows:", len(df))
+          if "url" in df.columns:
+              print("unique_urls:", df["url"].nunique())
+              print("sample_urls:", df["url"].head(5).tolist())
+          if "published_date" in df.columns:
+              dt = pd.to_datetime(df["published_date"], errors="coerce")
+              if dt.notna().any():
+                  print("date_range:", str(dt.min().date()), "->", str(dt.max().date()))
+          PY
+
+
       - name: Run Scrapy (latest 10 pages → temp CSV)
         run: |
           cd jpt_scraper
