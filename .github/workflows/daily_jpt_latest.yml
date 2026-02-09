@@ -1,4 +1,4 @@
-name: Daily JPT latest scrape
+name: Daily JPT scrape and merge
 
 on:
   schedule:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   scrape-and-merge:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -25,15 +26,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Scrape to daily CSV (overwritten each run)
+      - name: Scrape daily data (overwrite jpt_daily.csv)
         run: |
           python scripts/scrape_new.py
 
-      - name: Merge master + daily into merged CSV (no duplicate urls)
+      - name: Merge master + daily into jpt.csv
         run: |
           python scripts/merge_three_way.py
 
-      - name: Commit and push changes (daily + merged only)
+      - name: Commit and push changes
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
