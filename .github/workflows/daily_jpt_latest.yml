@@ -26,21 +26,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # (Optional but helpful) confirms scrapy.cfg is found
+      - name: Debug (confirm Scrapy project)
+        working-directory: jpt_scraper
+        run: |
+          pwd
+          ls -la
+          echo "scrapy.cfg present?"
+          test -f scrapy.cfg && echo "YES" || (echo "NO" && exit 1)
+          scrapy list
+
       - name: Scrape last 10 pages
+        working-directory: jpt_scraper
         run: |
           scrapy crawl jpt_latest \
-            -s SCRAPY_SETTINGS_MODULE=jpt_scraper.settings \
             -a max_pages=10 \
             -a stop_at_last_date=1 \
-            -a csv_path=jpt_scraper/data/jpt.csv \
-            -O jpt_scraper/data/_new.csv
+            -a csv_path=data/jpt.csv \
+            -O data/_new.csv
 
       - name: Merge + de-dupe
+        working-directory: jpt_scraper
         run: |
           python scripts/merge_jpt_csv.py
-          rm -f jpt_scraper/data/_new.csv
+          rm -f data/_new.csv
 
       - name: Commit and push if changed
+        working-directory: jpt_scraper
         run: |
           if git diff --quiet; then
             echo "No changes to commit."
@@ -48,6 +60,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add jpt_scraper/data/jpt.csv
+          git add data/jpt.csv
           git commit -m "Daily update: JPT latest (deduped)"
           git push
