@@ -3,20 +3,14 @@ name: Update JPT CSV (daily)
 on:
   workflow_dispatch: {}
   schedule:
-    # Runs daily at 14:00 UTC (06:00 Los Angeles during standard time)
-    - cron: "0 14 * * *"
+    - cron: "0 9 * * *"
 
 permissions:
   contents: write
 
-concurrency:
-  group: update-jpt-csv
-  cancel-in-progress: false
-
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,14 +27,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Scrapy (export to CSV)
+      - name: Run Scrapy to temp CSV
         run: |
           cd jpt_scraper
-          # Option A: If your pipeline already writes to jpt_scraper/data/jpt.csv, just run the spider:
-          scrapy crawl jpt_latest -a max_pages=10 -a refresh_existing=1
+          # IMPORTANT: write to a TEMP file (do NOT overwrite master directly)
+          scrapy crawl jpt_latest -a max_pages=10 -a refresh_existing=1 -O data/jpt_new.csv
 
-          # Option B (recommended): Always produce a clean daily export file from Scrapy feed export:
-          # scrapy crawl jpt_latest -a max_pages=10 -a refresh_existing=1 -O data/jpt.csv
+      - name: Merge temp into master CSV
+        run: |
+          python scripts/merge_jpt_csv.py
 
       - name: Commit & push if changed
         run: |
@@ -49,7 +44,6 @@ jobs:
 
           git add jpt_scraper/data/jpt.csv
 
-          # Only commit if there are actual changes
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
