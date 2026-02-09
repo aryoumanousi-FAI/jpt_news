@@ -4,9 +4,10 @@ from pathlib import Path
 import pandas as pd
 
 
-MASTER = Path("jpt_scraper/data/jpt.csv")       # your “main” file in the repo
-NEW = Path("jpt_scraper/data/jpt_new.csv")     # temp scrape output
-OUT = MASTER                                   # overwrite master with merged result
+ROOT = Path(__file__).resolve().parents[1]  # repo root
+MASTER = ROOT / "jpt_scraper" / "data" / "jpt.csv"
+NEW    = ROOT / "jpt_scraper" / "data" / "jpt_new.csv"
+OUT    = MASTER
 
 
 def _read_csv(p: Path) -> pd.DataFrame:
@@ -63,3 +64,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
