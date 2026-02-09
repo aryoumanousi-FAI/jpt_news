@@ -2,8 +2,8 @@ name: Daily JPT latest scrape
 
 on:
   schedule:
-    - cron: "0 14 * * *"
-  workflow_dispatch:
+    - cron: "0 14 * * *"  # Runs at 14:00 UTC every day
+  workflow_dispatch:      # Allows manual trigger button
 
 permissions:
   contents: write
@@ -26,26 +26,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug paths
-        run: |
-          echo "Repo root:"
-          pwd
-          ls -la
-          echo "Where is scrapy.cfg?"
-          find . -maxdepth 4 -name scrapy.cfg -print
-          echo "Which CSVs exist?"
-          ls -la jpt_scraper/data || true
-          ls -la jpt_scraper/jpt_scraper/data || true
-
-      - name: Scrape last 10 pages (write temp)
+      - name: Scrape last 10 pages
         working-directory: jpt_scraper
         run: |
+          # Output to _new.csv so we don't overwrite master directly
           scrapy crawl jpt_latest \
             -a max_pages=10 \
             -a stop_at_last_date=1 \
             -a csv_path=data/jpt.csv \
             -O data/_new.csv
 
-      - name: Merge + de-dupe into canonical master
+      - name: Merge new data into master
         run: |
+          # Run the merge script from the root
           python jpt_scraper/scripts/merge_jpt_csv.py
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add the updated master file
+          git add jpt_scraper/data/jpt.csv
+          
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto-update: JPT data [skip ci]"
+            git push
+          fi
