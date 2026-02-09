@@ -3,7 +3,7 @@ name: Update JPT CSV (daily)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 9 * * *"   # once per day (UTC)
+    - cron: "5 17 * * *"   # once per day (UTC)
 
 permissions:
   contents: write
