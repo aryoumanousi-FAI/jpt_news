@@ -1,7 +1,13 @@
-# app.py — JPT News Explorer (CSV)
-# - Topics: OR logic
-# - Countries: OR logic
-# - Tags: AND logic
+# app.py — JPT News Explorer (CSV) with:
+# - Last updated banner (file mtime + latest scraped_at)
+# - Tag + Topic normalization (Title Case + acronym preservation)
+# - Canonical tag mapping using all_tags.csv (case-insensitive; column: tag)
+# - Country filter (derived from tags) + manual additions: US, UK, UAE
+# - Cascading filters across Topics, Tags, Countries
+# - Toggle OR/AND matching for Topics, Tags, Countries via UI
+# - Clickable links IN the main table (HTML)
+# - Pagination (25 rows/page)
+# - Header bold + centered; Date single-line (no wrap)
 
 from __future__ import annotations
 
@@ -20,14 +26,14 @@ import streamlit as st
 # Config
 # -------------------
 DATA_PATH = Path("jpt_scraper/data/jpt.csv")
-ALL_TAGS_PATH = Path("all_tags.csv")
+ALL_TAGS_PATH = Path("all_tags.csv")  # must contain column: tag
 PAGE_SIZE = 25
 
 
 # -------------------
 # Normalization
 # -------------------
-WORD_SPLIT_RE = re.compile(r"(\s+|[-/])")
+WORD_SPLIT_RE = re.compile(r"(\s+|[-/])")  # keep separators
 
 BASE_ACRONYMS = {
     "AI", "ML", "US", "UK", "UAE", "LNG", "CCS", "CO2", "CO₂", "M&A", "HSE", "OPEC",
@@ -53,7 +59,9 @@ COUNTRY_ABBREV = {
 
 
 def _normalize_text(x) -> str:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
+    if x is None:
+        return ""
+    if isinstance(x, float) and pd.isna(x):
         return ""
     return " ".join(str(x).split()).strip()
 
@@ -63,9 +71,11 @@ def _parse_listish(value) -> list[str]:
         return []
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
+
     s = str(value).strip()
     if not s:
         return []
+
     if s.startswith("[") and s.endswith("]"):
         try:
             parsed = ast.literal_eval(s)
@@ -73,17 +83,44 @@ def _parse_listish(value) -> list[str]:
                 return [str(v).strip() for v in parsed if str(v).strip()]
         except Exception:
             pass
+
     return [p.strip() for p in s.split(",") if p.strip()]
 
 
 def _looks_like_acronym(token: str, acronyms: Set[str]) -> bool:
+    if not token:
+        return False
     t = token.strip()
-    return (
-        t.upper() in acronyms
-        or re.fullmatch(r"[A-Z]{2,}", t)
-        or re.fullmatch(r"[A-Za-z]{1,4}\d{1,3}", t)
-        or (("&" in t or "." in t) and any(c.isalpha() for c in t))
-    )
+
+    if t.upper() in acronyms:
+        return True
+    if re.fullmatch(r"[A-Za-z]{1,4}\d{1,3}", t):
+        return True
+    if re.fullmatch(r"[A-Z]{2,}", t):
+        return True
+    if re.search(r"[&.]", t) and re.search(r"[A-Za-z]", t):
+        return True
+
+    return False
+
+
+def _smart_title_token(token: str, acronyms: Set[str]) -> str:
+    raw = token.strip()
+    if not raw:
+        return token
+
+    if raw.isspace() or raw in {"-", "/"}:
+        return raw
+
+    if _looks_like_acronym(raw, acronyms):
+        up = raw.upper()
+        return "CO2" if up == "CO₂" else up
+
+    # preserve intentional internal casing (e.g., "iPhone", "eBay", "McDermott")
+    if any(c.isupper() for c in raw[1:]) and any(c.islower() for c in raw):
+        return raw
+
+    return raw[:1].upper() + raw[1:].lower()
 
 
 def normalize_phrase(s: str, acronyms: Set[str]) -> str:
@@ -91,163 +128,474 @@ def normalize_phrase(s: str, acronyms: Set[str]) -> str:
     if not s:
         return ""
     parts = WORD_SPLIT_RE.split(s)
-    out = []
-    for p in parts:
-        raw = p.strip()
-        if not raw or raw.isspace() or raw in {"-", "/"}:
-            out.append(p)
-        elif _looks_like_acronym(raw, acronyms):
-            out.append(raw.upper())
-        elif any(c.isupper() for c in raw[1:]):
-            out.append(raw)
-        else:
-            out.append(raw[:1].upper() + raw[1:].lower())
-    return re.sub(r"\s+", " ", "".join(out)).strip().replace("Co2", "CO2")
+    out = "".join(_smart_title_token(p, acronyms) for p in parts)
+    out = re.sub(r"\s+", " ", out).strip()
+    out = out.replace("Co2", "CO2").replace("Co₂", "CO2")
+    return out
+
+
+def load_master_tags(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    df = pd.read_csv(path)
+    if "tag" not in df.columns:
+        return []
+    return [_normalize_text(x) for x in df["tag"].tolist() if _normalize_text(x)]
+
+
+def build_acronym_set(master_tags: List[str]) -> Set[str]:
+    acronyms = set(BASE_ACRONYMS)
+    for t in master_tags:
+        t = _normalize_text(t)
+        if not t:
+            continue
+        if re.fullmatch(r"[A-Z0-9&./-]{2,}", t) and re.search(r"[A-Z]", t):
+            acronyms.add(t.upper())
+        if re.search(r"[&.]", t) and re.search(r"[A-Za-z]", t):
+            acronyms.add(t.upper())
+    return acronyms
+
+
+def build_canonical_tag_map(master_tags: List[str], acronyms: Set[str]) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    for t in master_tags:
+        key = _normalize_text(t).lower()
+        if not key:
+            continue
+        m[key] = normalize_phrase(t, acronyms)
+    return m
 
 
 # -------------------
-# Load + normalize data
+# Countries
+# -------------------
+@st.cache_resource
+def build_country_set_cached() -> Set[str]:
+    out: Set[str] = {"US", "UK", "UAE"}
+    try:
+        import pycountry  # type: ignore
+
+        for c in pycountry.countries:
+            for name in [getattr(c, "name", None), getattr(c, "official_name", None), getattr(c, "common_name", None)]:
+                if not name:
+                    continue
+                out.add(COUNTRY_ABBREV.get(name, name))
+    except Exception:
+        out |= {
+            "Canada", "Mexico", "Brazil", "Argentina", "Norway", "France", "Germany", "Italy", "Spain",
+            "Australia", "India", "China", "Japan", "Saudi Arabia", "Qatar", "Kuwait", "Oman",
+            "Iraq", "Iran", "Libya", "Nigeria", "Angola", "Egypt",
+        }
+    return out
+
+
+def canonical_country_from_tag(tag: str) -> str | None:
+    t = _normalize_text(tag)
+    if not t:
+        return None
+    if t in COUNTRY_ABBREV:
+        return COUNTRY_ABBREV[t]
+    tl = t.lower()
+    for k, v in COUNTRY_ABBREV.items():
+        if tl == k.lower():
+            return v
+    return None
+
+
+# -------------------
+# Last updated banner
+# -------------------
+def format_last_updated(csv_path: Path, df: pd.DataFrame) -> str:
+    try:
+        mtime = datetime.fromtimestamp(csv_path.stat().st_mtime)
+        file_updated = mtime.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        file_updated = "Unknown"
+
+    data_updated = None
+    if "scraped_at" in df.columns:
+        s = pd.to_datetime(df["scraped_at"], errors="coerce", utc=True)
+        if s.notna().any():
+            latest = s.max()
+            data_updated = latest.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if data_updated:
+        return f"Last updated at **{file_updated}** (file) • Latest scrape in data: **{data_updated}**"
+    return f"Last updated at **{file_updated}**"
+
+
+# -------------------
+# Data loading
 # -------------------
 @st.cache_data(ttl=60)
 def load_data(csv_path: str, master_tags_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+    data_path = Path(csv_path)
+    if not data_path.exists():
+        return pd.DataFrame()
 
-    for col in ["url", "title", "excerpt", "published_date", "topics", "tags", "scraped_at"]:
-        if col not in df.columns:
-            df[col] = ""
+    df = pd.read_csv(data_path)
+
+    expected = ["url", "title", "excerpt", "published_date", "topics", "tags", "scraped_at", "refresh_existing"]
+    for c in expected:
+        if c not in df.columns:
+            df[c] = ""
 
     df["url"] = df["url"].map(_normalize_text)
     df["title"] = df["title"].map(_normalize_text)
     df["excerpt"] = df["excerpt"].map(_normalize_text)
     df["published_date"] = pd.to_datetime(df["published_date"], errors="coerce").dt.date
 
-    df["topics_list"] = df["topics"].map(_parse_listish)
-    df["tags_list"] = df["tags"].map(_parse_listish)
+    df["topics_list_raw"] = df["topics"].map(_parse_listish)
+    df["tags_list_raw"] = df["tags"].map(_parse_listish)
 
-    acronyms = set(BASE_ACRONYMS)
+    master_tags = load_master_tags(Path(master_tags_path))
+    acronyms = build_acronym_set(master_tags)
+    canon_map = build_canonical_tag_map(master_tags, acronyms)
 
-    df["topics_list"] = df["topics_list"].apply(
-        lambda xs: [normalize_phrase(x, acronyms) for x in xs]
+    def norm_tag(x: str) -> str:
+        x0 = _normalize_text(x)
+        if not x0:
+            return ""
+        key = x0.lower()
+        if key in canon_map:
+            return canon_map[key]
+        return normalize_phrase(x0, acronyms)
+
+    df["tags_list"] = df["tags_list_raw"].apply(
+        lambda xs: [norm_tag(t) for t in (xs or []) if norm_tag(t)]
     )
-    df["tags_list"] = df["tags_list"].apply(
-        lambda xs: [normalize_phrase(x, acronyms) for x in xs]
+
+    df["topics_list"] = df["topics_list_raw"].apply(
+        lambda xs: [normalize_phrase(_normalize_text(t), acronyms) for t in (xs or []) if _normalize_text(t)]
     )
 
-    df = df[df["url"].astype(bool)]
-    df = df.drop_duplicates("url", keep="last")
-    df = df.sort_values("published_date", ascending=False).reset_index(drop=True)
+    df = df[df["url"].astype(bool)].copy()
+    df = df.drop_duplicates(subset=["url"], keep="last")
+    df = df.sort_values("published_date", ascending=False, na_position="last").reset_index(drop=True)
 
-    # Countries derived from tags
-    def extract_countries(tags: List[str]) -> List[str]:
-        found = set()
-        for t in tags:
-            if t in COUNTRY_ABBREV:
-                found.add(COUNTRY_ABBREV[t])
+    country_set = build_country_set_cached()
+
+    def countries_from_tags(tags: List[str]) -> List[str]:
+        found: Set[str] = set()
+        for t in tags or []:
+            c = canonical_country_from_tag(t)
+            if c:
+                found.add(c)
+        for t in tags or []:
+            if t in country_set:
+                found.add(t)
         return sorted(found)
 
-    df["countries_list"] = df["tags_list"].apply(extract_countries)
-
+    df["countries_list"] = df["tags_list"].apply(countries_from_tags)
     return df
 
 
 # -------------------
-# Filtering logic
+# Filtering
 # -------------------
+def match_keywords(text: str, keywords: list[str], any_mode: bool) -> bool:
+    if not keywords:
+        return True
+    t = (text or "").lower()
+    ks = [k.lower() for k in keywords]
+    return any(k in t for k in ks) if any_mode else all(k in t for k in ks)
+
+
 def must_include_all(selected: list[str], row_values: list[str]) -> bool:
-    return not selected or all(s in set(row_values) for s in selected)
+    if not selected:
+        return True
+    row_set = set(row_values or [])
+    return all(s in row_set for s in selected)
 
 
 def must_include_any(selected: list[str], row_values: list[str]) -> bool:
-    return not selected or any(s in set(row_values) for s in selected)
+    if not selected:
+        return True
+    row_set = set(row_values or [])
+    return any(s in row_set for s in selected)
+
+
+def apply_match(selected: list[str], row_values: list[str], mode: str) -> bool:
+    # mode: "OR" or "AND"
+    if mode == "AND":
+        return must_include_all(selected, row_values)
+    return must_include_any(selected, row_values)
+
+
+def available_values_from_subset(subset: pd.DataFrame, col_list: str) -> list[str]:
+    values: set[str] = set()
+    for xs in subset[col_list].tolist():
+        for x in xs or []:
+            values.add(x)
+    return sorted(values)
 
 
 def apply_filters(
     df: pd.DataFrame,
     start_d: date,
     end_d: date,
-    keywords: list[str],
+    keyword_list: list[str],
     any_mode: bool,
-    topics: list[str],
-    tags: list[str],
-    countries: list[str],
+    selected_topics: list[str],
+    selected_tags: list[str],
+    selected_countries: list[str],
+    topics_mode: str,
+    tags_mode: str,
+    countries_mode: str,
 ) -> pd.Series:
-    mask = df["published_date"].between(start_d, end_d, inclusive="both")
+    mask = pd.Series(True, index=df.index)
 
-    if keywords:
-        text = (df["title"] + " " + df["excerpt"]).str.lower()
-        if any_mode:
-            mask &= text.apply(lambda t: any(k.lower() in t for k in keywords))
-        else:
-            mask &= text.apply(lambda t: all(k.lower() in t for k in keywords))
+    mask &= df["published_date"].between(start_d, end_d, inclusive="both")
 
-    mask &= df["topics_list"].apply(lambda xs: must_include_any(topics, xs))
-    mask &= df["countries_list"].apply(lambda xs: must_include_any(countries, xs))
-    mask &= df["tags_list"].apply(lambda xs: must_include_all(tags, xs))
+    if keyword_list:
+        combined = (df["title"].fillna("") + " " + df["excerpt"].fillna("")).astype(str)
+        mask &= combined.apply(lambda t: match_keywords(t, keyword_list, any_mode))
+
+    if selected_topics:
+        mask &= df["topics_list"].apply(lambda xs: apply_match(selected_topics, xs, topics_mode))
+
+    if selected_tags:
+        mask &= df["tags_list"].apply(lambda xs: apply_match(selected_tags, xs, tags_mode))
+
+    if selected_countries:
+        mask &= df["countries_list"].apply(lambda xs: apply_match(selected_countries, xs, countries_mode))
 
     return mask
 
 
-def make_link(url: str, title: str) -> str:
-    return f'<a href="{html.escape(url)}" target="_blank">{html.escape(title)}</a>'
+def make_html_link(url: str, title: str) -> str:
+    u = html.escape(url, quote=True)
+    t = html.escape(title)
+    return f'<a href="{u}" target="_blank" rel="noopener noreferrer">{t}</a>'
 
 
 # -------------------
 # UI
 # -------------------
-st.set_page_config("JPT News", layout="wide")
+st.set_page_config(page_title="JPT News", layout="wide")
 st.title("JPT News Explorer")
 
-df = load_data(str(DATA_PATH), str(ALL_TAGS_PATH))
-st.caption(f"Loaded {len(df)} articles")
+if not DATA_PATH.exists():
+    st.warning(
+        f"Could not find your CSV at `{DATA_PATH}`.\n\n"
+        "Update `DATA_PATH` at the top of `app.py` to point to your exported CSV."
+    )
+    st.stop()
 
-min_d, max_d = df["published_date"].min(), df["published_date"].max()
+df = load_data(str(DATA_PATH), str(ALL_TAGS_PATH))
+st.info(format_last_updated(DATA_PATH, df))
+
+if df.empty:
+    st.info("No rows found in the CSV (or required columns missing).")
+    st.stop()
+
+st.caption(
+    f"Loaded **{len(df)}** articles from **{DATA_PATH.as_posix()}**. "
+    "Filters use title + excerpt + normalized topics + normalized tags + published date."
+)
+
+min_date = df["published_date"].min()
+max_date = df["published_date"].max()
+if pd.isna(min_date) or min_date is None:
+    min_date = date(2000, 1, 1)
+if pd.isna(max_date) or max_date is None:
+    max_date = date.today()
+
+for key in ["selected_topics", "selected_tags", "selected_countries", "topics_mode", "tags_mode", "countries_mode"]:
+    if key not in st.session_state:
+        if key.endswith("_mode"):
+            st.session_state[key] = "OR"
+        else:
+            st.session_state[key] = []
+
+# Defaults:
+# - Topics: OR
+# - Countries: OR
+# - Tags: AND (as you requested originally, but now toggleable)
+st.session_state.tags_mode = st.session_state.get("tags_mode", "AND")
 
 with st.sidebar:
     st.header("Filters")
 
-    keyword_input = st.text_input("Keywords (comma-separated)")
-    keyword_mode = st.radio("Keyword match", ["Any", "All"])
-    keywords = [k.strip() for k in keyword_input.split(",") if k.strip()]
+    keyword_input = st.text_input("Keywords (comma-separated)", "")
+    keyword_mode = st.radio("Keyword match", ["Any keyword", "All keywords"], index=0)
+    keyword_list = [k.strip() for k in keyword_input.split(",") if k.strip()]
+    any_mode = (keyword_mode == "Any keyword")
 
-    start_d, end_d = st.date_input("Date range", (min_d, max_d))
+    st.divider()
 
-    topics = st.multiselect("Topics (match ANY)", sorted({t for xs in df["topics_list"] for t in xs}))
-    tags = st.multiselect("Tags (match ALL)", sorted({t for xs in df["tags_list"] for t in xs}))
-    countries = st.multiselect("Country (match ANY)", sorted({c for xs in df["countries_list"] for c in xs}))
+    start_d, end_d = st.date_input(
+        "Date range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
 
-mask = apply_filters(
-    df,
-    start_d,
-    end_d,
-    keywords,
-    keyword_mode == "Any",
-    topics,
-    tags,
-    countries,
+    st.divider()
+    st.subheader("Match mode")
+    st.radio("Topics match", ["OR", "AND"], key="topics_mode", horizontal=True)
+    st.radio("Tags match", ["OR", "AND"], key="tags_mode", horizontal=True)
+    st.radio("Countries match", ["OR", "AND"], key="countries_mode", horizontal=True)
+
+    st.divider()
+
+    # Topics depend on everything except topics
+    mask_topics = apply_filters(
+        df=df,
+        start_d=start_d,
+        end_d=end_d,
+        keyword_list=keyword_list,
+        any_mode=any_mode,
+        selected_topics=[],
+        selected_tags=st.session_state.selected_tags,
+        selected_countries=st.session_state.selected_countries,
+        topics_mode=st.session_state.topics_mode,
+        tags_mode=st.session_state.tags_mode,
+        countries_mode=st.session_state.countries_mode,
+    )
+    avail_topics = available_values_from_subset(df[mask_topics], "topics_list")
+    st.session_state.selected_topics = [t for t in st.session_state.selected_topics if t in avail_topics]
+    st.multiselect(
+        f"Topics ({'match any' if st.session_state.topics_mode=='OR' else 'match all'})",
+        options=avail_topics,
+        key="selected_topics",
+    )
+
+    # Tags depend on everything except tags
+    mask_tags = apply_filters(
+        df=df,
+        start_d=start_d,
+        end_d=end_d,
+        keyword_list=keyword_list,
+        any_mode=any_mode,
+        selected_topics=st.session_state.selected_topics,
+        selected_tags=[],
+        selected_countries=st.session_state.selected_countries,
+        topics_mode=st.session_state.topics_mode,
+        tags_mode=st.session_state.tags_mode,
+        countries_mode=st.session_state.countries_mode,
+    )
+    avail_tags = available_values_from_subset(df[mask_tags], "tags_list")
+    st.session_state.selected_tags = [t for t in st.session_state.selected_tags if t in avail_tags]
+    st.multiselect(
+        f"Tags ({'match any' if st.session_state.tags_mode=='OR' else 'match all'})",
+        options=avail_tags,
+        key="selected_tags",
+    )
+
+    # Countries depend on everything except countries
+    mask_countries = apply_filters(
+        df=df,
+        start_d=start_d,
+        end_d=end_d,
+        keyword_list=keyword_list,
+        any_mode=any_mode,
+        selected_topics=st.session_state.selected_topics,
+        selected_tags=st.session_state.selected_tags,
+        selected_countries=[],
+        topics_mode=st.session_state.topics_mode,
+        tags_mode=st.session_state.tags_mode,
+        countries_mode=st.session_state.countries_mode,
+    )
+    avail_countries = available_values_from_subset(df[mask_countries], "countries_list")
+    st.session_state.selected_countries = [c for c in st.session_state.selected_countries if c in avail_countries]
+    st.multiselect(
+        f"Country ({'match any' if st.session_state.countries_mode=='OR' else 'match all'})",
+        options=avail_countries,
+        key="selected_countries",
+    )
+
+    st.divider()
+    st.caption("Tip: your GitHub Action / scheduler updates the CSV. Refresh this page to see new data.")
+
+final_mask = apply_filters(
+    df=df,
+    start_d=start_d,
+    end_d=end_d,
+    keyword_list=keyword_list,
+    any_mode=any_mode,
+    selected_topics=st.session_state.selected_topics,
+    selected_tags=st.session_state.selected_tags,
+    selected_countries=st.session_state.selected_countries,
+    topics_mode=st.session_state.topics_mode,
+    tags_mode=st.session_state.tags_mode,
+    countries_mode=st.session_state.countries_mode,
 )
 
-results = df[mask]
+results = df[final_mask].copy()
+
 st.subheader(f"Results ({len(results)})")
 
 if results.empty:
-    st.info("No matches found.")
+    st.info("No matches. Try widening the date range or removing some filters.")
     st.stop()
 
-page = st.number_input("Page", 1, max(1, (len(results) - 1) // PAGE_SIZE + 1))
-page_df = results.iloc[(page - 1) * PAGE_SIZE : page * PAGE_SIZE].copy()
+# Pagination
+total_rows = len(results)
+total_pages = max(1, (total_rows + PAGE_SIZE - 1) // PAGE_SIZE)
 
-page_df["Article"] = page_df.apply(lambda r: make_link(r["url"], r["title"]), axis=1)
+colA, colB, colC = st.columns([2, 3, 5])
+with colA:
+    page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+with colB:
+    st.caption(f"{total_pages} page(s) • {PAGE_SIZE} rows/page")
+with colC:
+    st.caption("Showing newest first")
 
-st.write(
-    page_df[["published_date", "Article", "countries_list", "topics_list", "tags_list", "excerpt"]]
-    .rename(columns={"published_date": "Date", "excerpt": "Excerpt"})
-    .to_html(escape=False, index=False),
-    unsafe_allow_html=True,
-)
+start_i = (page - 1) * PAGE_SIZE
+end_i = start_i + PAGE_SIZE
+page_df = results.iloc[start_i:end_i].copy()
+
+page_df["Date"] = page_df["published_date"].astype(str)
+page_df["Countries"] = page_df["countries_list"].apply(lambda xs: ", ".join(xs or []))
+page_df["Topics"] = page_df["topics_list"].apply(lambda xs: ", ".join(xs or []))
+page_df["Tags"] = page_df["tags_list"].apply(lambda xs: ", ".join(xs or []))
+page_df["Article"] = page_df.apply(lambda r: make_html_link(r["url"], r["title"]), axis=1)
+
+table = page_df[["Date", "Article", "Countries", "Topics", "Tags", "excerpt"]].rename(columns={"excerpt": "Excerpt"})
+
+css = """
+<style>
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  font-weight: 700 !important;
+  text-align: center !important;
+  border-bottom: 2px solid #ddd;
+  padding: 10px 8px;
+}
+tbody td {
+  border-bottom: 1px solid #eee;
+  padding: 8px;
+  vertical-align: top;
+}
+tbody td:first-child, thead th:first-child {
+  white-space: nowrap;   /* Date column single-line */
+}
+</style>
+"""
+
+st.markdown(css, unsafe_allow_html=True)
+st.write(table.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+st.caption(f"Showing rows {start_i + 1}-{min(end_i, total_rows)} of {total_rows}.")
+
+# Download filtered results (all rows, not just this page)
+download_df = results.copy()
+download_df["topics"] = download_df["topics_list"].apply(lambda xs: ", ".join(xs or []))
+download_df["tags"] = download_df["tags_list"].apply(lambda xs: ", ".join(xs or []))
+download_df["countries"] = download_df["countries_list"].apply(lambda xs: ", ".join(xs or []))
+
+cols_out = [
+    c for c in [
+        "published_date", "url", "title", "excerpt",
+        "topics", "tags", "countries", "scraped_at"
+    ]
+    if c in download_df.columns
+]
 
 st.download_button(
-    "Download filtered results",
-    results.to_csv(index=False).encode(),
-    "jpt_filtered.csv",
-    "text/csv",
+    "Download filtered results (CSV)",
+    data=download_df[cols_out].to_csv(index=False).encode("utf-8"),
+    file_name="jpt_filtered.csv",
+    mime="text/csv",
 )
