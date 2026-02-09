@@ -1,7 +1,8 @@
 # app.py — JPT News Explorer (CSV) with:
+# - Last updated banner (file mtime + latest scraped_at)
 # - Tag + Topic normalization (Title Case + acronym preservation)
-# - Canonical tag mapping using all_tags.csv (case-insensitive)
-# - Country filter (derived from tags) + manual country additions: US, UK, UAE
+# - Canonical tag mapping using all_tags.csv (case-insensitive; column: tag)
+# - Country filter (derived from tags) + manual additions: US, UK, UAE
 # - Cascading filters across Topics, Tags, Countries
 # - Clickable links IN the main table (HTML)
 # - Pagination (25 rows/page)
@@ -12,7 +13,7 @@ from __future__ import annotations
 import ast
 import html
 import re
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Set
 
@@ -114,6 +115,7 @@ def _smart_title_token(token: str, acronyms: Set[str]) -> str:
         up = raw.upper()
         return "CO2" if up == "CO₂" else up
 
+    # preserve intentional internal casing (e.g., "iPhone", "eBay", "McDermott")
     if any(c.isupper() for c in raw[1:]) and any(c.islower() for c in raw):
         return raw
 
@@ -146,6 +148,7 @@ def build_acronym_set(master_tags: List[str]) -> Set[str]:
         t = _normalize_text(t)
         if not t:
             continue
+        # broad: if it looks like an acronym-ish token, add upper
         if re.fullmatch(r"[A-Z0-9&./-]{2,}", t) and re.search(r"[A-Z]", t):
             acronyms.add(t.upper())
         if re.search(r"[&.]", t) and re.search(r"[A-Za-z]", t):
@@ -167,9 +170,12 @@ def build_canonical_tag_map(master_tags: List[str], acronyms: Set[str]) -> Dict[
 # Countries
 # -------------------
 def build_country_set() -> Set[str]:
+    # Always include these
     out: Set[str] = {"US", "UK", "UAE"}
+    # Try pycountry if available; otherwise fallback list
     try:
         import pycountry  # type: ignore
+
         for c in pycountry.countries:
             for name in [getattr(c, "name", None), getattr(c, "official_name", None), getattr(c, "common_name", None)]:
                 if not name:
@@ -188,13 +194,37 @@ def canonical_country_from_tag(tag: str) -> str | None:
     t = _normalize_text(tag)
     if not t:
         return None
+    # direct key
     if t in COUNTRY_ABBREV:
         return COUNTRY_ABBREV[t]
+    # case-insensitive match
     tl = t.lower()
     for k, v in COUNTRY_ABBREV.items():
         if tl == k.lower():
             return v
     return None
+
+
+# -------------------
+# Last updated banner
+# -------------------
+def format_last_updated(csv_path: Path, df: pd.DataFrame) -> str:
+    try:
+        mtime = datetime.fromtimestamp(csv_path.stat().st_mtime)
+        file_updated = mtime.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        file_updated = "Unknown"
+
+    data_updated = None
+    if "scraped_at" in df.columns:
+        s = pd.to_datetime(df["scraped_at"], errors="coerce", utc=True)
+        if s.notna().any():
+            latest = s.max()
+            data_updated = latest.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if data_updated:
+        return f"Last updated at **{file_updated}** (file) • Latest scrape in data: **{data_updated}**"
+    return f"Last updated at **{file_updated}**"
 
 
 # -------------------
@@ -234,16 +264,17 @@ def load_data(csv_path: str, master_tags_path: str) -> pd.DataFrame:
             return canon_map[key]
         return normalize_phrase(x0, acronyms)
 
-    # Normalize tags
+    # Normalize tags (canonical map first)
     df["tags_list"] = df["tags_list_raw"].apply(
         lambda xs: [norm_tag(t) for t in (xs or []) if norm_tag(t)]
     )
 
-    # Normalize topics (same logic, but no canonical map required)
+    # Normalize topics (no canonical map, but same title/acronym logic)
     df["topics_list"] = df["topics_list_raw"].apply(
         lambda xs: [normalize_phrase(_normalize_text(t), acronyms) for t in (xs or []) if _normalize_text(t)]
     )
 
+    # Clean
     df = df[df["url"].astype(bool)].copy()
     df = df.drop_duplicates(subset=["url"], keep="last")
     df = df.sort_values("published_date", ascending=False, na_position="last").reset_index(drop=True)
@@ -340,6 +371,8 @@ if not DATA_PATH.exists():
     st.stop()
 
 df = load_data(str(DATA_PATH), str(ALL_TAGS_PATH))
+st.info(format_last_updated(DATA_PATH, df))
+
 if df.empty:
     st.info("No rows found in the CSV (or required columns missing).")
     st.stop()
@@ -356,9 +389,9 @@ if pd.isna(min_date) or min_date is None:
 if pd.isna(max_date) or max_date is None:
     max_date = date.today()
 
-for key in ["selected_topics", "selected_tags", "selected_countries", "page"]:
+for key in ["selected_topics", "selected_tags", "selected_countries"]:
     if key not in st.session_state:
-        st.session_state[key] = [] if "selected_" in key else 1
+        st.session_state[key] = []
 
 with st.sidebar:
     st.header("Filters")
@@ -425,11 +458,7 @@ with st.sidebar:
     st.multiselect("Country (must include all selected)", options=avail_countries, key="selected_countries")
 
     st.divider()
-    st.caption("Tip: re-run your scraper to refresh the CSV, then reload this page.")
-
-# Reset page to 1 when filters change (simple approach)
-# If Streamlit reruns and current page exceeds max, we clamp later.
-st.session_state.page = 1
+    st.caption("Tip: your GitHub Action / scheduler updates the CSV. Refresh this page to see new data.")
 
 final_mask = apply_filters(
     df=df,
@@ -453,12 +482,18 @@ if results.empty:
 total_rows = len(results)
 total_pages = max(1, (total_rows + PAGE_SIZE - 1) // PAGE_SIZE)
 
-page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+colA, colB, colC = st.columns([2, 3, 5])
+with colA:
+    page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+with colB:
+    st.caption(f"{total_pages} page(s) • {PAGE_SIZE} rows/page")
+with colC:
+    st.caption(f"Showing newest first")
+
 start_i = (page - 1) * PAGE_SIZE
 end_i = start_i + PAGE_SIZE
 page_df = results.iloc[start_i:end_i].copy()
 
-# Prepare table
 page_df["Date"] = page_df["published_date"].astype(str)
 page_df["Countries"] = page_df["countries_list"].apply(lambda xs: ", ".join(xs or []))
 page_df["Topics"] = page_df["topics_list"].apply(lambda xs: ", ".join(xs or []))
@@ -467,10 +502,6 @@ page_df["Article"] = page_df.apply(lambda r: make_html_link(r["url"], r["title"]
 
 table = page_df[["Date", "Article", "Countries", "Topics", "Tags", "excerpt"]].rename(columns={"excerpt": "Excerpt"})
 
-# HTML table styling:
-# - header bold + centered
-# - prevent wrapping in Date col
-# - keep links clickable
 css = """
 <style>
 table { width: 100%; border-collapse: collapse; }
@@ -494,7 +525,7 @@ tbody td:first-child, thead th:first-child {
 st.markdown(css, unsafe_allow_html=True)
 st.write(table.to_html(escape=False, index=False), unsafe_allow_html=True)
 
-st.caption(f"Showing rows {start_i + 1}-{min(end_i, total_rows)} of {total_rows} (25 per page).")
+st.caption(f"Showing rows {start_i + 1}-{min(end_i, total_rows)} of {total_rows}.")
 
 # Download filtered results (all rows, not just this page)
 download_df = results.copy()
