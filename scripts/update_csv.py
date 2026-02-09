@@ -3,49 +3,69 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-
 import pandas as pd
 
+# Assumes structure:
+# jpt_scraper/           (Repo Root / Scrapy Project Root)
+#   scrapy.cfg
+#   jpt_scraper/         (Python Package)
+#     scripts/           (Where this file is)
+#       update_csv.py
+#     data/              (Where csvs are)
+#       jpt.csv
+#
+# So parents[1] gets us to 'jpt_scraper' package folder.
+# If your data is in the *outer* root, change this to parents[2].
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+CSV_PATH = PACKAGE_ROOT / "data" / "jpt.csv"
+TMP_OUT = PACKAGE_ROOT / "data" / "_new.csv"
+PROJECT_ROOT = PACKAGE_ROOT.parent  # The folder containing scrapy.cfg
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-CSV_PATH = REPO_ROOT / "jpt_scraper" / "data" / "jpt.csv"
-TMP_OUT = REPO_ROOT / "jpt_scraper" / "data" / "_new.csv"
-
-# Change these if your spider uses different names/args
-SPIDER_NAME = os.getenv("SPIDER_NAME", "jpt")  # e.g. "jpt"
-LAST_N_PAGES = int(os.getenv("LAST_N_PAGES", "10"))
-
+# Must match the 'name' defined in your spider class
+SPIDER_NAME = os.getenv("SPIDER_NAME", "jpt_latest") 
+MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
 
 def run_scrape() -> None:
     """
-    Runs your scraper and writes ONLY newly scraped rows to TMP_OUT.
-    You have two options:
-      A) Call scrapy spider directly (recommended if you already have Scrapy)
-      B) Call a custom python scraper script if you have one
+    Runs the Scrapy spider and outputs to TMP_OUT.
     """
-
     if TMP_OUT.exists():
         TMP_OUT.unlink()
 
-    # Option A: Scrapy spider (most common)
-    # Assumes your spider supports passing max_pages or last_pages.
-    # If it doesn't yet, I explain below how to add it.
+    print(f"--- Starting Scrape ---")
+    print(f"Spider: {SPIDER_NAME}")
+    print(f"Output: {TMP_OUT}")
+    print(f"Reference CSV: {CSV_PATH}")
+
+    # Build command
+    # We pass 'stop_at_last_date=1' and 'csv_path' so the spider 
+    # knows when to stop crawling (optimization).
     cmd = [
         "scrapy",
         "crawl",
         SPIDER_NAME,
-        "-a",
-        f"last_pages={LAST_N_PAGES}",
-        "-O",
-        str(TMP_OUT),  # -O overwrites file each run
+        "-a", f"max_pages={MAX_PAGES}",
+        "-a", "stop_at_last_date=1",
+        "-a", f"csv_path={CSV_PATH}",
+        "-O", str(TMP_OUT),
     ]
 
-    subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
-
+    # Run from PROJECT_ROOT so scrapy.cfg is found
+    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
 
 def merge_dedupe() -> int:
+    print(f"\n--- Starting Merge ---")
+    
     if not CSV_PATH.exists():
-        raise FileNotFoundError(f"Existing CSV not found: {CSV_PATH}")
+        # If master doesn't exist, just rename new to master
+        if TMP_OUT.exists():
+            print("Master CSV not found. Renaming new scan to master.")
+            TMP_OUT.rename(CSV_PATH)
+            return pd.read_csv(CSV_PATH).shape[0]
+        else:
+            print("No master CSV and no new data. Exiting.")
+            return 0
+
     if not TMP_OUT.exists():
         print("No new scrape output found; nothing to merge.")
         return 0
@@ -53,18 +73,20 @@ def merge_dedupe() -> int:
     old_df = pd.read_csv(CSV_PATH)
     new_df = pd.read_csv(TMP_OUT)
 
-    # Basic sanity check
     if "url" not in new_df.columns:
         raise ValueError("New scrape output must include a 'url' column for de-duplication.")
 
     combined = pd.concat([old_df, new_df], ignore_index=True)
 
+    # Convert dates for sorting
+    if "scraped_at" in combined.columns:
+        combined["scraped_at"] = pd.to_datetime(combined["scraped_at"], errors="coerce")
+        combined = combined.sort_values(by=["scraped_at"], ascending=True)
+
     # De-dupe by URL (keep newest row if same URL appears)
-    combined["scraped_at"] = pd.to_datetime(combined.get("scraped_at"), errors="coerce")
-    combined = combined.sort_values(by=["scraped_at"], ascending=True)
     combined = combined.drop_duplicates(subset=["url"], keep="last")
 
-    # Optional: sort for readability
+    # Sort for readability
     if "published_date" in combined.columns:
         combined["published_date"] = pd.to_datetime(combined["published_date"], errors="coerce")
         combined = combined.sort_values(by=["published_date", "scraped_at"], ascending=[False, False])
@@ -74,12 +96,10 @@ def merge_dedupe() -> int:
     added = len(combined) - len(old_df)
     return max(added, 0)
 
-
 def main() -> None:
     run_scrape()
     added = merge_dedupe()
-    print(f"Done. Added ~{added} new rows (after de-dupe).")
-
+    print(f"Done. Added {added} new rows.")
 
 if __name__ == "__main__":
     main()
