@@ -6,20 +6,18 @@ from pathlib import Path
 import pandas as pd
 
 # 1. Determine paths relative to this script
-# Script location: jpt_scraper/scripts/update_csv.py
-# Parent [1]:      jpt_scraper/ (Project Root, where scrapy.cfg usually is)
+# Assumes script is at: jpt_scraper/scripts/update_csv.py
+# PROJECT_ROOT will be: jpt_scraper/
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 
 CSV_PATH = DATA_DIR / "jpt.csv"
 TMP_OUT = DATA_DIR / "_new.csv"
 
-# 2. MATCH THE SPIDER NAME from your scraper file
-# Your class is JptLatestSpider(name="jpt_latest")
+# 2. FIX: Match the 'name' defined in your spider class
 SPIDER_NAME = os.getenv("SPIDER_NAME", "jpt_latest")
 
-# 3. MATCH THE ARGUMENT NAME
-# Your spider uses 'max_pages', not 'last_pages'
+# 3. FIX: Match the argument name in your spider's __init__
 MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
 
 def run_scrape() -> None:
@@ -53,6 +51,10 @@ def run_scrape() -> None:
 def merge_dedupe() -> int:
     print(f"\n--- Starting Merge ---")
     
+    # Ensure data directory exists
+    if not DATA_DIR.exists():
+        DATA_DIR.mkdir(parents=True)
+
     if not CSV_PATH.exists():
         # If master doesn't exist, just rename new to master
         if TMP_OUT.exists():
@@ -94,9 +96,6 @@ def merge_dedupe() -> int:
     return max(added, 0)
 
 def main() -> None:
-    # Ensure data directory exists
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
     run_scrape()
     added = merge_dedupe()
     print(f"Done. Added {added} new rows.")
