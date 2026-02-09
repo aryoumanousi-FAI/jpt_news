@@ -5,7 +5,9 @@ import subprocess
 from pathlib import Path
 
 
-# --- PATHS ---
+# -------------------
+# PATHS
+# -------------------
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
 
@@ -14,7 +16,9 @@ DATA_DIR = SCRAPY_ROOT / "data"
 
 DAILY_CSV = DATA_DIR / "jpt_daily.csv"
 
-# --- CONFIG ---
+# -------------------
+# CONFIG
+# -------------------
 SPIDER_NAME = os.getenv("SPIDER_NAME", "jpt_latest")
 MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
 
@@ -26,7 +30,7 @@ def main() -> None:
         DAILY_CSV.unlink()
 
     print("--- Scrape step (daily only) ---")
-    print(f"SCRAPY_ROOT: {SCRAPY_ROOT}")
+    print(f"Scrapy root: {SCRAPY_ROOT}")
     print(f"Spider:      {SPIDER_NAME}")
     print(f"MAX_PAGES:   {MAX_PAGES}")
     print(f"Output:      {DAILY_CSV}")
