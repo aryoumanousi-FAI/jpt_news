@@ -27,7 +27,7 @@ jobs:
 
       - name: Run Scrape and Merge
         run: |
-          # Now pointing to the root 'scripts' folder
+          # Use the script in the root scripts folder
           python scripts/update_csv.py
 
       - name: Commit and push changes
