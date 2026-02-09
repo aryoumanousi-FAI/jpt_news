@@ -6,40 +6,39 @@ from pathlib import Path
 import pandas as pd
 
 # --- PATH CONFIGURATION ---
-# Script location:  repo_root/scripts/update_csv.py
-# SCRIPTS_DIR:      repo_root/scripts
-# REPO_ROOT:        repo_root/
+# Script:  repo_root/scripts/update_csv.py
+# Parent:  repo_root/scripts
+# Root:    repo_root
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
 
-# The folder containing scrapy.cfg
+# Define where the spider and data live
+# Structure: repo_root/jpt_scraper/data/jpt.csv
 SCRAPY_ROOT = REPO_ROOT / "jpt_scraper"
-
-# The folder containing the CSVs (inside jpt_scraper based on your structure)
 DATA_DIR = SCRAPY_ROOT / "data"
 CSV_PATH = DATA_DIR / "jpt.csv"
 TMP_OUT = DATA_DIR / "_new.csv"
 
-# --- SPIDER CONFIGURATION ---
-# Must match the 'name' in your spider class (JptLatestSpider)
+# Config
 SPIDER_NAME = os.getenv("SPIDER_NAME", "jpt_latest")
-# Must match the argument in your spider's __init__
 MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
 
 
 def run_scrape() -> None:
-    """
-    Runs the Scrapy spider from the SCRAPY_ROOT directory.
-    """
+    """Runs Scrapy and writes to _new.csv"""
     if TMP_OUT.exists():
         TMP_OUT.unlink()
 
     print(f"--- Starting Scrape ---")
-    print(f"CWD (Scrapy Root): {SCRAPY_ROOT}")
     print(f"Spider: {SPIDER_NAME}")
-    print(f"Output: {TMP_OUT}")
+    print(f"Master CSV Path: {CSV_PATH}")
+    
+    # Check if master exists before we start, just for logging
+    if CSV_PATH.exists():
+        print(f"  -> Found master CSV at {CSV_PATH}")
+    else:
+        print(f"  -> WARNING: Master CSV NOT found at {CSV_PATH}. This will be a fresh file if not fixed.")
 
-    # Build command
     cmd = [
         "scrapy", "crawl", SPIDER_NAME,
         "-a", f"max_pages={MAX_PAGES}",
@@ -48,72 +47,69 @@ def run_scrape() -> None:
         "-O", str(TMP_OUT),
     ]
 
-    # IMPORTANT: Run inside the jpt_scraper folder so it finds scrapy.cfg
+    # Run inside jpt_scraper folder so scrapy.cfg is found
     subprocess.run(cmd, cwd=str(SCRAPY_ROOT), check=True)
 
 
 def merge_dedupe() -> int:
     print(f"\n--- Starting Merge ---")
     
-    # Ensure data directory exists
     if not DATA_DIR.exists():
         DATA_DIR.mkdir(parents=True)
 
-    if not CSV_PATH.exists():
-        # If master doesn't exist, try to use the new scan as master
-        if TMP_OUT.exists():
-            print("Master CSV not found. Renaming new scan to master.")
-            TMP_OUT.rename(CSV_PATH)
-            return pd.read_csv(CSV_PATH).shape[0]
-        else:
-            print("No master CSV and no new data. Exiting.")
-            return 0
-
+    # 1. Load New Data
     if not TMP_OUT.exists():
-        print("No new scrape output found; nothing to merge.")
+        print("No new scrape output found. Exiting.")
         return 0
-
-    # Read Files
-    old_df = pd.read_csv(CSV_PATH)
+    
     new_df = pd.read_csv(TMP_OUT)
+    print(f"New rows scraped: {len(new_df)}")
 
     if "url" not in new_df.columns:
-        raise ValueError("New scrape output must include a 'url' column.")
+        raise ValueError("New scrape output missing 'url' column.")
 
-    # Combine
+    # 2. Load Old Data
+    if CSV_PATH.exists():
+        old_df = pd.read_csv(CSV_PATH)
+        print(f"Existing rows loaded: {len(old_df)}")
+    else:
+        print("Master CSV not found. Starting fresh.")
+        old_df = pd.DataFrame()
+
+    # 3. Combine
     combined = pd.concat([old_df, new_df], ignore_index=True)
+    total_before_dedupe = len(combined)
 
-    # Clean & Sort
+    # 4. Clean & Sort
     if "scraped_at" in combined.columns:
         combined["scraped_at"] = pd.to_datetime(combined["scraped_at"], errors="coerce")
         combined = combined.sort_values(by="scraped_at")
 
-    # Deduplicate (Keep newest by scraped_at)
+    # 5. Deduplicate (Keep newest version of the URL)
     combined = combined.drop_duplicates(subset=["url"], keep="last")
 
-    # Final Sort (by published date)
+    # Final Sort
     if "published_date" in combined.columns:
         combined["published_date"] = pd.to_datetime(combined["published_date"], errors="coerce")
         combined = combined.sort_values(by=["published_date", "scraped_at"], ascending=[False, False])
 
-    # Save
+    # 6. Save
     combined.to_csv(CSV_PATH, index=False)
-
-    added = len(combined) - len(old_df)
+    
+    final_count = len(combined)
+    added = final_count - len(old_df)
+    print(f"Merge Complete. Final Total: {final_count} (Added: {added})")
+    
     return max(added, 0)
 
 
 def main() -> None:
-    # Run the scrape
     try:
         run_scrape()
-    except subprocess.CalledProcessError as e:
-        print(f"Scrapy failed with error code {e.returncode}. Check logs.")
+        merge_dedupe()
+    except Exception as e:
+        print(f"FATAL ERROR: {e}")
         exit(1)
-
-    # Run the merge
-    added = merge_dedupe()
-    print(f"Done. Added {added} new rows.")
 
 
 if __name__ == "__main__":
