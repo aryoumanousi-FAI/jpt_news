@@ -1,4 +1,3 @@
-# scripts/merge_jpt_csv.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,8 +11,10 @@ OUT = MASTER
 
 EXPECTED_COLS = ["url", "title", "excerpt", "published_date", "topics", "tags", "scraped_at"]
 
-# Your full history is ~9000 rows; fail fast if master is unexpectedly small.
-MIN_MASTER_ROWS = 7000
+# --- Safety expectations for your dataset ---
+# Full history should go back to ~2012 and be thousands of unique URLs.
+MIN_UNIQUE_URLS = 7000
+MAX_ALLOWED_MIN_DATE = pd.Timestamp("2014-01-01")  # if master starts after this, it's suspicious
 
 
 def _sniff_sep(p: Path) -> str:
@@ -23,9 +24,7 @@ def _sniff_sep(p: Path) -> str:
         return dialect.delimiter
     except Exception:
         first_line = sample.splitlines()[0] if sample.splitlines() else ""
-        if first_line.count("\t") >= 2:
-            return "\t"
-        return ","
+        return "\t" if first_line.count("\t") >= 2 else ","
 
 
 def _read_any_delim(p: Path) -> pd.DataFrame:
@@ -71,6 +70,27 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _master_looks_valid(old: pd.DataFrame) -> tuple[bool, str]:
+    """Return (ok, reason_if_not_ok)."""
+    if old.empty:
+        return False, "master is empty after parsing"
+
+    unique_urls = old["url"].nunique()
+
+    # parse min published_date
+    dt = pd.to_datetime(old["published_date"], errors="coerce")
+    min_dt = dt.min() if dt.notna().any() else pd.NaT
+
+    if unique_urls < MIN_UNIQUE_URLS:
+        return False, f"too few unique URLs ({unique_urls} < {MIN_UNIQUE_URLS})"
+
+    if pd.notna(min_dt) and min_dt > MAX_ALLOWED_MIN_DATE:
+        return False, f"history too recent (min published_date {min_dt.date()} > {MAX_ALLOWED_MIN_DATE.date()})"
+
+    # If min_dt is NaT, we still allow it only if URLs are large (already checked)
+    return True, "ok"
+
+
 def main() -> None:
     old_raw = _read_any_delim(MASTER)
     new_raw = _read_any_delim(NEW)
@@ -82,16 +102,17 @@ def main() -> None:
         print("Both master and new are empty. Nothing to do.")
         return
 
-    # Guard 1: refuse to overwrite if master isn't your full dataset
-    if MASTER.exists() and not old_raw.empty and len(old) < MIN_MASTER_ROWS:
-        raise RuntimeError(
-            f"ABORT: master jpt.csv is too small ({len(old)} rows). "
-            f"Expected at least {MIN_MASTER_ROWS}. Not overwriting."
-        )
+    # Guard: never overwrite a suspicious / truncated master
+    if MASTER.exists() and not old_raw.empty:
+        ok, reason = _master_looks_valid(old)
+        if not ok:
+            raise RuntimeError(
+                f"ABORT: master jpt.csv looks wrong ({reason}). Not overwriting."
+            )
 
     combined = pd.concat([old, new], ignore_index=True)
 
-    # De-dupe by URL (keep newest scraped_at)
+    # Keep newest scraped_at per URL
     combined["_scraped"] = pd.to_datetime(combined["scraped_at"], errors="coerce")
     combined = combined.sort_values(["url", "_scraped"], ascending=[True, True])
     combined = combined.drop_duplicates(subset=["url"], keep="last").drop(columns=["_scraped"])
@@ -99,12 +120,6 @@ def main() -> None:
     # Sort newest first by published_date
     combined["_pub"] = pd.to_datetime(combined["published_date"], errors="coerce")
     combined = combined.sort_values("_pub", ascending=False, na_position="last").drop(columns=["_pub"])
-
-    # Guard 2: once master is "big", never allow shrinking
-    if len(old) >= MIN_MASTER_ROWS and len(combined) < len(old):
-        raise RuntimeError(
-            f"ABORT: merged rows ({len(combined)}) < old rows ({len(old)}). Not overwriting."
-        )
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(OUT, index=False, encoding="utf-8")
