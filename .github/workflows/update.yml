@@ -29,6 +29,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Show master size (sanity check)
+        run: |
+          ls -lh jpt_scraper/data/jpt.csv || true
+          wc -l jpt_scraper/data/jpt.csv || true
+
       - name: Run Scrapy (latest 10 pages → temp CSV)
         run: |
           cd jpt_scraper
@@ -43,6 +48,8 @@ jobs:
         run: |
           test -f jpt_scraper/data/jpt_new.csv
           echo "jpt_new.csv exists"
+          ls -lh jpt_scraper/data/jpt_new.csv
+          wc -l jpt_scraper/data/jpt_new.csv
 
       - name: Merge new data into master jpt.csv
         run: |
