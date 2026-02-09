@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-import pandas as pd
 import csv
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 MASTER = ROOT / "jpt_scraper" / "data" / "jpt.csv"
@@ -11,89 +11,95 @@ OUT = MASTER
 
 EXPECTED_COLS = ["url", "title", "excerpt", "published_date", "topics", "tags", "scraped_at"]
 
-# Your dataset is ~8k+ URLs and goes back to 2012.
+# Your full history is ~8k URLs and goes back to ~2012
 MIN_UNIQUE_URLS = 5000
 MAX_ALLOWED_MIN_DATE = pd.Timestamp("2014-01-01")  # master should start earlier than this
 
 
-def _read_multiline_csv(path: Path) -> pd.DataFrame:
+def _read_with_csv_module(path: Path) -> list[dict]:
     """
-    Read a comma CSV that may contain quoted multiline fields (e.g., excerpt).
-    engine=python is slower but correct for multiline content.
+    Multiline-safe CSV reader using Python stdlib csv module.
+    This avoids pandas.read_csv quirks with messy quoting/multiline fields.
     """
     if not path.exists():
-        return pd.DataFrame()
+        return []
 
-    return pd.read_csv(
-        path,
-        sep=",",
-        dtype=str,
-        keep_default_na=False,
-        engine="python",
-        quotechar='"',
-        doublequote=True,
-    )
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            return []
+
+        # Normalize header names (strip BOM/whitespace)
+        fieldnames = [h.strip().lstrip("\ufeff") for h in reader.fieldnames]
+        reader.fieldnames = fieldnames
+
+        rows: list[dict] = []
+        for r in reader:
+            # r keys will match reader.fieldnames
+            rows.append(r)
+
+    return rows
 
 
-def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+def _records_to_df(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=EXPECTED_COLS)
 
-    # clean headers
+    df = pd.DataFrame(rows)
+
+    # Normalize headers
     df.columns = [c.strip().lstrip("\ufeff") for c in df.columns]
 
-    # ensure expected columns exist
+    # Ensure expected columns exist
     for c in EXPECTED_COLS:
         if c not in df.columns:
             df[c] = ""
 
-    # clean values
+    # Clean strings
     for c in EXPECTED_COLS:
         df[c] = df[c].astype(str).str.strip()
 
-    # drop missing urls
+    # Drop rows without URL
     df = df[df["url"] != ""].copy()
     return df
 
 
-def _guard_master(master: pd.DataFrame) -> None:
-    """
-    Prevent overwriting history if master is accidentally small or too recent.
-    """
-    if master.empty:
+def _guard_master(df_master: pd.DataFrame) -> None:
+    if df_master.empty:
         raise RuntimeError("ABORT: master parsed empty. Not overwriting.")
 
-    unique_urls = master["url"].nunique()
+    unique_urls = df_master["url"].nunique()
 
-    dt = pd.to_datetime(master["published_date"], errors="coerce")
+    dt = pd.to_datetime(df_master["published_date"], errors="coerce")
     min_dt = dt.min() if dt.notna().any() else pd.NaT
 
-    # If URL count is big enough, we consider it safe even if some dates are missing.
-    if unique_urls >= MIN_UNIQUE_URLS:
-        # additionally ensure it's not a "recent-only" dataset
-        if pd.notna(min_dt) and min_dt > MAX_ALLOWED_MIN_DATE:
-            raise RuntimeError(
-                f"ABORT: master looks recent-only (min published_date {min_dt.date()}). Not overwriting."
-            )
-        return
+    if unique_urls < MIN_UNIQUE_URLS:
+        raise RuntimeError(
+            f"ABORT: master too small (unique URLs {unique_urls} < {MIN_UNIQUE_URLS}). Not overwriting."
+        )
 
-    raise RuntimeError(
-        f"ABORT: master too small (unique URLs {unique_urls} < {MIN_UNIQUE_URLS}). Not overwriting."
-    )
+    if pd.notna(min_dt) and min_dt > MAX_ALLOWED_MIN_DATE:
+        raise RuntimeError(
+            f"ABORT: master looks recent-only (min published_date {min_dt.date()} > {MAX_ALLOWED_MIN_DATE.date()}). Not overwriting."
+        )
 
 
 def main() -> None:
-    old_raw = _read_multiline_csv(MASTER)
-    new_raw = _read_multiline_csv(NEW)
+    # Read using csv module (multiline safe)
+    old_rows = _read_with_csv_module(MASTER)
+    new_rows = _read_with_csv_module(NEW)
 
-    old = _normalize(old_raw)
-    new = _normalize(new_raw)
+    old = _records_to_df(old_rows)
+    new = _records_to_df(new_rows)
+
+    # Helpful minimal diagnostics (won't spam)
+    print(f"MASTER parsed rows: {len(old)} | unique URLs: {old['url'].nunique() if not old.empty else 0}")
+    print(f"NEW parsed rows:    {len(new)} | unique URLs: {new['url'].nunique() if not new.empty else 0}")
 
     if old.empty and new.empty:
         print("Both master and new are empty. Nothing to do.")
         return
 
-    # Guard: only if master exists (first run can be allowed if you choose)
     if MASTER.exists():
         _guard_master(old)
 
@@ -110,12 +116,13 @@ def main() -> None:
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write consistently (this helps keep the file stable over time)
+    # Write consistently; csv.QUOTE_MINIMAL keeps file sane
     combined.to_csv(
         OUT,
         index=False,
         encoding="utf-8",
         quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\n",
     )
 
     print(f"Merged OK: old={len(old)} new={len(new)} => out={len(combined)}")
