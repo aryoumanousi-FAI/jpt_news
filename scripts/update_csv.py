@@ -2,43 +2,55 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 import pandas as pd
 
 # --- PATH CONFIGURATION ---
-# Script:  repo_root/scripts/update_csv.py
-# Parent:  repo_root/scripts
-# Root:    repo_root
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
 
-# Define where the spider and data live
-# Structure: repo_root/jpt_scraper/data/jpt.csv
+# Based on your structure:
+# repo/jpt_scraper/data/jpt.csv
 SCRAPY_ROOT = REPO_ROOT / "jpt_scraper"
 DATA_DIR = SCRAPY_ROOT / "data"
 CSV_PATH = DATA_DIR / "jpt.csv"
 TMP_OUT = DATA_DIR / "_new.csv"
 
-# Config
 SPIDER_NAME = os.getenv("SPIDER_NAME", "jpt_latest")
 MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
 
+def check_paths():
+    """Debugs paths and ensures Master CSV exists."""
+    print(f"--- Path Check ---")
+    print(f"Repo Root:  {REPO_ROOT}")
+    print(f"Data Dir:   {DATA_DIR}")
+    print(f"Master CSV: {CSV_PATH}")
+
+    if not DATA_DIR.exists():
+        print(f"ERROR: Data directory not found at {DATA_DIR}")
+        print(f"Contents of {SCRAPY_ROOT}:")
+        if SCRAPY_ROOT.exists():
+            print(os.listdir(SCRAPY_ROOT))
+        else:
+            print("  (Scrapy Root not found)")
+        sys.exit(1)
+
+    if not CSV_PATH.exists():
+        print(f"CRITICAL ERROR: Master CSV not found at {CSV_PATH}")
+        print(f"Contents of {DATA_DIR}:")
+        print(os.listdir(DATA_DIR))
+        print("\n!!! ABORTING TO PREVENT OVERWRITE !!!")
+        print("Please check if jpt.csv is in your git repo or if it is ignored by .gitignore")
+        sys.exit(1) # <--- THIS STOPS THE OVERWRITE
+    
+    print("SUCCESS: Master CSV found.")
 
 def run_scrape() -> None:
-    """Runs Scrapy and writes to _new.csv"""
     if TMP_OUT.exists():
         TMP_OUT.unlink()
 
-    print(f"--- Starting Scrape ---")
-    print(f"Spider: {SPIDER_NAME}")
-    print(f"Master CSV Path: {CSV_PATH}")
-    
-    # Check if master exists before we start, just for logging
-    if CSV_PATH.exists():
-        print(f"  -> Found master CSV at {CSV_PATH}")
-    else:
-        print(f"  -> WARNING: Master CSV NOT found at {CSV_PATH}. This will be a fresh file if not fixed.")
-
+    print(f"\n--- Starting Scrape ---")
     cmd = [
         "scrapy", "crawl", SPIDER_NAME,
         "-a", f"max_pages={MAX_PAGES}",
@@ -46,46 +58,31 @@ def run_scrape() -> None:
         "-a", f"csv_path={CSV_PATH}",
         "-O", str(TMP_OUT),
     ]
-
-    # Run inside jpt_scraper folder so scrapy.cfg is found
     subprocess.run(cmd, cwd=str(SCRAPY_ROOT), check=True)
-
 
 def merge_dedupe() -> int:
     print(f"\n--- Starting Merge ---")
     
-    if not DATA_DIR.exists():
-        DATA_DIR.mkdir(parents=True)
-
-    # 1. Load New Data
+    # 1. Read New Data
     if not TMP_OUT.exists():
-        print("No new scrape output found. Exiting.")
+        print("No new scrape output found.")
         return 0
-    
     new_df = pd.read_csv(TMP_OUT)
-    print(f"New rows scraped: {len(new_df)}")
+    print(f"New rows: {len(new_df)}")
 
-    if "url" not in new_df.columns:
-        raise ValueError("New scrape output missing 'url' column.")
-
-    # 2. Load Old Data
-    if CSV_PATH.exists():
-        old_df = pd.read_csv(CSV_PATH)
-        print(f"Existing rows loaded: {len(old_df)}")
-    else:
-        print("Master CSV not found. Starting fresh.")
-        old_df = pd.DataFrame()
+    # 2. Read Old Data (Guaranteed to exist by check_paths)
+    old_df = pd.read_csv(CSV_PATH)
+    print(f"Old rows: {len(old_df)}")
 
     # 3. Combine
     combined = pd.concat([old_df, new_df], ignore_index=True)
-    total_before_dedupe = len(combined)
-
+    
     # 4. Clean & Sort
     if "scraped_at" in combined.columns:
         combined["scraped_at"] = pd.to_datetime(combined["scraped_at"], errors="coerce")
         combined = combined.sort_values(by="scraped_at")
 
-    # 5. Deduplicate (Keep newest version of the URL)
+    # 5. Deduplicate
     combined = combined.drop_duplicates(subset=["url"], keep="last")
 
     # Final Sort
@@ -96,21 +93,14 @@ def merge_dedupe() -> int:
     # 6. Save
     combined.to_csv(CSV_PATH, index=False)
     
-    final_count = len(combined)
-    added = final_count - len(old_df)
-    print(f"Merge Complete. Final Total: {final_count} (Added: {added})")
-    
+    added = len(combined) - len(old_df)
+    print(f"Merged. Final count: {len(combined)} (Added: {added})")
     return max(added, 0)
 
-
 def main() -> None:
-    try:
-        run_scrape()
-        merge_dedupe()
-    except Exception as e:
-        print(f"FATAL ERROR: {e}")
-        exit(1)
-
+    check_paths() # <--- SAFETY FIRST
+    run_scrape()
+    merge_dedupe()
 
 if __name__ == "__main__":
     main()
