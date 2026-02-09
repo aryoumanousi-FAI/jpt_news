@@ -1,3 +1,4 @@
+# .github/workflows/update.yml
 name: Update JPT CSV (daily)
 
 on:
@@ -31,7 +32,17 @@ jobs:
       - name: Run Scrapy (latest 10 pages → temp CSV)
         run: |
           cd jpt_scraper
-          scrapy crawl jpt_latest -a max_pages=10 -a refresh_existing=1 -O data/jpt_new.csv
+          scrapy crawl jpt_latest \
+            -a max_pages=10 \
+            -a refresh_existing=1 \
+            -s FEED_EXPORT_ENCODING=utf-8 \
+            -s FEED_FORMAT=csv \
+            -O data/jpt_new.csv
+
+      - name: Assert new CSV exists (fail loudly if scrape produced nothing)
+        run: |
+          test -f jpt_scraper/data/jpt_new.csv
+          echo "jpt_new.csv exists"
 
       - name: Merge temp CSV into master CSV
         run: |
