@@ -5,6 +5,9 @@ on:
     - cron: "0 14 * * *"
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  
 # Prevent overlapping runs from fighting over commits/pushes
 concurrency:
   group: og-news-daily
